@@ -6,7 +6,7 @@ import crypto from 'crypto';
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!TOKEN) throw new Error('Missing TELEGRAM_BOT_TOKEN');
 const bot = new Telegraf(TOKEN);
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+let CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const MIN_SCORE = Number(process.env.MIN_SCORE || 68);
 const MIN_DIRECTION_GAP = Number(process.env.MIN_DIRECTION_GAP || 12);
 const MIN_ADX = Number(process.env.MIN_ADX || 18);
@@ -247,8 +247,11 @@ function ingest(symbol,tick){
   // Surveille les positions ouvertes sur CHAQUE tick : TP, SL, horizon et retournement.
   // Sans cet appel, monitorTrade existe mais n'est jamais exécuté.
   void monitorTrade(symbol,tick).catch(err=>console.error(`❌ Trade monitor error ${symbol}:`,err.message));
-  const sec=Math.floor(tick.t/1000)*1000; let c=s.current;
-  if(!c||c.t!==sec){ if(c)s.candles.push(c); c={t:sec,o:tick.p,h:tick.p,l:tick.p,c:tick.p,v:tick.q}; s.current=c; if(s.candles.length>300)s.candles.shift(); } else {c.h=Math.max(c.h,tick.p);c.l=Math.min(c.l,tick.p);c.c=tick.p;c.v+=tick.q;}
+  // Build REAL 1-minute candles from trades. The previous V13 used 1-second
+  // buckets here, which polluted the 1m/5m resampling and could suppress signals.
+  const minute=Math.floor(tick.t/60000)*60000; let c=s.current;
+  if(!c||c.t!==minute){ if(c) s.candles.push(c); c={t:minute,o:tick.p,h:tick.p,l:tick.p,c:tick.p,v:tick.q}; s.current=c; if(s.candles.length>400)s.candles.shift(); }
+  else {c.h=Math.max(c.h,tick.p);c.l=Math.min(c.l,tick.p);c.c=tick.p;c.v+=tick.q;}
   if(s.candles.length<210)return;
   const sig=scoreSignal(s); if(!sig||sig.direction==='NONE')return;
   // Never send a Telegram alert for a setup whose expected move cannot cover
@@ -260,13 +263,14 @@ function ingest(symbol,tick){
 }
 
 async function sendSignal(symbol,s){
-  if(paused || !CHAT_ID) return;
+  if(paused) return;
+  if(!CHAT_ID){ console.warn(`⚠️ No Telegram target chat configured; use /start once in the bot chat or set TELEGRAM_CHAT_ID.`); return; }
   const icon=s.direction==='UP'?'🟢':'🔴'; const dir=s.direction==='UP'?'HAUT':'BAS';
   const id=crypto.randomUUID();
   pendingSignals.set(id,{symbol,s,createdAt:Date.now(),used:false});
   setTimeout(()=>pendingSignals.delete(id),SIGNAL_TTL_MS);
   const text=`${icon} <b>TRADEGUARD LIVE</b>\n\n<b>${dir} — ${symbol}</b>\n\n💰 Prix: ${s.price}\n⏱️ Horizon estimé: <b>${s.horizonSec}s</b>\n📊 Score modèle: <b>${s.score}/100</b>\n\nRSI: ${s.r.toFixed(1)}\nADX: ${s.ad.toFixed(1)}\nATR: ${s.atrPct.toFixed(2)}%\nVolume: ${s.volRatio.toFixed(2)}x\n\n🛑 Invalidation: ${s.sl.toFixed(8)}\n🎯 Objectif modèle: ${s.tp.toFixed(8)}\n\n⚠️ Le score n'est pas une probabilité de gain.`;
-  await bot.telegram.sendMessage(CHAT_ID,text,{parse_mode:'HTML',...Markup.inlineKeyboard([[Markup.button.callback('💰 TRADE',`trade:${id}`),Markup.button.callback('⏭️ SKIP',`skip:${id}`)]])}).catch(()=>{});
+  await bot.telegram.sendMessage(CHAT_ID,text,{parse_mode:'HTML',...Markup.inlineKeyboard([[Markup.button.callback('💰 TRADE',`trade:${id}`),Markup.button.callback('⏭️ SKIP',`skip:${id}`)]])});
 }
 
 bot.action(/^skip:(.+)$/, async ctx=>{
@@ -303,6 +307,24 @@ bot.action(/^trade:(.+)$/, async ctx=>{
   }
 });
 
+async function bootstrapHistory(symbols){
+  console.log('📚 Chargement historique 1m pour analyse...');
+  for(const symbol of symbols){
+    try{
+      const url=`${BINANCE_BASE}/fapi/v1/klines?symbol=${symbol.toUpperCase()}&interval=1m&limit=300`;
+      const res=await fetch(url);
+      if(!res.ok) throw new Error(`HTTP ${res.status}`);
+      const rows=await res.json();
+      const s=state.get(symbol.toUpperCase()) || {candles:[],current:null,lastSignal:{},ticks:[]};
+      s.candles=rows.slice(0,-1).map(k=>({t:Number(k[0]),o:Number(k[1]),h:Number(k[2]),l:Number(k[3]),c:Number(k[4]),v:Number(k[5])}));
+      const last=rows.at(-1);
+      if(last) s.current={t:Number(last[0]),o:Number(last[1]),h:Number(last[2]),l:Number(last[3]),c:Number(last[4]),v:Number(last[5])};
+      state.set(symbol.toUpperCase(),s);
+      console.log(`✅ ${symbol.toUpperCase()}: ${s.candles.length} bougies 1m chargées`);
+    }catch(err){ console.error(`⚠️ Historique ${symbol} indisponible:`,err.message); }
+  }
+}
+
 function connect(){
   const streams=(process.env.SYMBOLS||'').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean);
   const syms=streams.length?streams:['btcusdt','ethusdt','solusdt','bnbusdt','xrpusdt','dogeusdt','adausdt','avaxusdt','linkusdt','suiusdt'];
@@ -315,13 +337,33 @@ function connect(){
   ws.on('error',err=>console.error('Market WebSocket error:',err.message));
 }
 
+bot.use(async (ctx,next)=>{
+  const id=ctx.chat?.id;
+  if(id) CHAT_ID=String(id);
+  return next();
+});
+
 bot.start(ctx=>ctx.reply('🛡️ TradeGuard Live actif.\n\n/signals — état du moteur\n/pause — désactiver les alertes\n/resume — réactiver les alertes\n\nLes signaux sont envoyés automatiquement.'));
 bot.command('signals',ctx=>ctx.reply(`🧠 Moteur LIVE\nScore minimum: ${MIN_SCORE}/100\nGap direction: ${MIN_DIRECTION_GAP}\nADX minimum: ${MIN_ADX}\nR/R minimum: ${MIN_RR}\nCooldown: ${COOLDOWN_MS/1000}s\nLimite: ${MAX_ALERTS_HOUR}/h\nEnvoi: automatique\nMode: Binance Futures\nTrading réel: ${LIVE_TRADING?'ACTIF':'DÉSACTIVÉ'}\nTaille: ${TRADE_USDT} USDT\nLevier de base: ${BASE_LEVERAGE}x\nLevier cible max: ${MAX_TARGET_LEVERAGE}x\nObjectif: x${(1+TARGET_PROFIT_MULTIPLE).toFixed(2)}\nTrailing: actif`));
+bot.command('signal',ctx=>{
+  const symbol=(ctx.message.text.split(/\s+/)[1]||'').toUpperCase();
+  const symbols=symbol?[symbol]:[...state.keys()];
+  const out=[];
+  for(const sym of symbols){
+    const st=state.get(sym);
+    if(!st||st.candles.length<210){ out.push(`❌ ${sym}: historique insuffisant (${st?.candles.length||0}/210)`); continue; }
+    const sig=scoreSignal(st);
+    if(!sig||sig.direction==='NONE') out.push(`⏳ ${sym}: aucun signal confirmé`);
+    else out.push(`✅ ${sym}: ${sig.direction==='UP'?'HAUT':'BAS'} | score ${sig.score}/100 | RSI ${sig.r.toFixed(1)} | ADX ${sig.ad.toFixed(1)}`);
+  }
+  return ctx.reply('🔎 Analyse manuelle\n\n'+out.join('\n'));
+});
 bot.command('test',ctx=>ctx.reply('🧪 TradeGuard OK — Telegram est bien connecté.\n\nLe moteur LIVE est actif et prêt à envoyer les alertes.'));
 bot.command('pause',ctx=>{paused=true;ctx.reply('⏸️ Alertes suspendues.');});
 bot.command('resume',ctx=>{paused=false;ctx.reply('▶️ Alertes réactivées.');});
-bot.launch().then(()=>console.log('Telegram bot polling started')).catch(err=>console.error('Telegram launch error:',err.message));
-connect();
-console.log('TradeGuard V9 Futures Testnet started');
+bot.launch({dropPendingUpdates:true}).then(()=>console.log(`Telegram bot polling started | target chat: ${CHAT_ID || 'auto from /start'}`)).catch(err=>{console.error('❌ Telegram launch error:',err.message); process.exitCode=1;});
+const bootSymbols=(process.env.SYMBOLS||'btcusdt,ethusdt,solusdt,bnbusdt,xrpusdt,dogeusdt,adausdt,avaxusdt,linkusdt,suiusdt').split(',').map(x=>x.trim().toUpperCase()).filter(Boolean);
+bootstrapHistory(bootSymbols).catch(err=>console.error('Bootstrap error:',err.message)).finally(()=>connect());
+console.log('TradeGuard V13 Smart Filter Testnet started');
 process.once('SIGINT',()=>bot.stop('SIGINT'));
 process.once('SIGTERM',()=>bot.stop('SIGTERM'));
