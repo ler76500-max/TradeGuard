@@ -133,8 +133,11 @@ function chooseTargetPlan(sig){
       if(net>=TARGET_PROFIT_MULTIPLE) break;
     }
   }
-  // Ignore tiny opportunities that are unlikely to overcome execution noise.
-  if(achievable < 0.25) return null;
+  // Only reject opportunities that are not expected to be profitable AFTER
+  // round-trip fees. Smaller positive opportunities are allowed; x2 remains
+  // the target when the market can support it, otherwise the bot lets the
+  // trade target the maximum plausible positive move.
+  if(achievable <= 0) return null;
   const effectiveTargetMultiple=Math.min(TARGET_PROFIT_MULTIPLE, achievable);
   const requiredMovePct=(effectiveTargetMultiple/leverage)+feeRoundTrip;
   const targetMovePct=Math.min(maxMovePct, requiredMovePct);
@@ -222,6 +225,9 @@ function ingest(symbol,tick){
   if(!c||c.t!==sec){ if(c)s.candles.push(c); c={t:sec,o:tick.p,h:tick.p,l:tick.p,c:tick.p,v:tick.q}; s.current=c; if(s.candles.length>300)s.candles.shift(); } else {c.h=Math.max(c.h,tick.p);c.l=Math.min(c.l,tick.p);c.c=tick.p;c.v+=tick.q;}
   if(s.candles.length<210)return;
   const sig=scoreSignal(s); if(!sig||sig.direction==='NONE')return;
+  // Never send a Telegram alert for a setup whose expected move cannot cover
+  // round-trip fees. The user should only see potentially profitable setups.
+  const plan=chooseTargetPlan(sig); if(!plan)return;
   const key=sig.direction; const now=Date.now(); if(now-(s.lastSignal[key]||0)<COOLDOWN_MS)return;
   while(recentAlerts.length&&recentAlerts[0]<now-3600000)recentAlerts.shift(); if(recentAlerts.length>=MAX_ALERTS_HOUR)return;
   s.lastSignal[key]=now; recentAlerts.push(now); sendSignal(symbol,sig).catch(err=>console.error('Signal send error:',err.message));
