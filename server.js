@@ -83,7 +83,12 @@ function connect(){
   // Binance combined trade stream. If SYMBOLS empty, fetch is avoided here for portability; default liquid majors.
   const syms=streams.length?streams:['btcusdt','ethusdt','solusdt','bnbusdt','xrpusdt','dogeusdt','adausdt','avaxusdt','linkusdt','suiusdt'];
   const url='wss://stream.binance.com:9443/stream?streams='+syms.map(x=>x+'@trade').join('/');
-  ws=new WebSocket(url); ws.on('open',()=>console.log('TradeGuard LIVE connected:',syms.join(','))); ws.on('message',raw=>{try{const m=JSON.parse(raw.toString());const d=m.data;if(d?.s&&d?.p)ingest(d.s,{t:Number(d.T||Date.now()),p:Number(d.p),q:Number(d.q||0)});}catch{}}); ws.on('close',()=>setTimeout(connect,3000)); ws.on('error',()=>{});
+  console.log('Connecting to market data:', url);
+  ws=new WebSocket(url);
+  ws.on('open',()=>console.log('TradeGuard LIVE connected:',syms.join(',')));
+  ws.on('message',raw=>{try{const m=JSON.parse(raw.toString());const d=m.data;if(d?.s&&d?.p)ingest(d.s,{t:Number(d.T||Date.now()),p:Number(d.p),q:Number(d.q||0)});}catch(err){console.error('Market message error:',err.message);}});
+  ws.on('close',(code,reason)=>{console.error('Market WebSocket closed:',code,reason?.toString()||''); setTimeout(connect,3000);});
+  ws.on('error',err=>console.error('Market WebSocket error:',err.message));
 }
 bot.start(ctx=>ctx.reply('🛡️ TradeGuard Live V3 actif.\n\n/signals — état du moteur\n/pause — désactiver les alertes\n/resume — réactiver les alertes\n\nMode: analyse + paper trading.'));
 bot.command('signals',ctx=>ctx.reply(`🧠 Moteur LIVE\nScore minimum: ${MIN_SCORE}/100\nCooldown: ${COOLDOWN_MS/1000}s\nLimite: ${MAX_ALERTS_HOUR}/h\nMode: paper trading`));
