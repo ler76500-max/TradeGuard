@@ -7,7 +7,11 @@ const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!TOKEN) throw new Error('Missing TELEGRAM_BOT_TOKEN');
 const bot = new Telegraf(TOKEN);
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
-const MIN_SCORE = Number(process.env.MIN_SCORE || 50);
+const MIN_SCORE = Number(process.env.MIN_SCORE || 68);
+const MIN_DIRECTION_GAP = Number(process.env.MIN_DIRECTION_GAP || 12);
+const MIN_ADX = Number(process.env.MIN_ADX || 18);
+const MIN_RR = Number(process.env.MIN_RR || 1.8);
+const MAX_SL_ATR = Number(process.env.MAX_SL_ATR || 1.25);
 const COOLDOWN_MS = Number(process.env.COOLDOWN_SECONDS || 10) * 1000;
 const MAX_ALERTS_HOUR = Number(process.env.MAX_ALERTS_PER_HOUR || 20);
 const TRADE_USDT = Number(process.env.TRADE_USDT || 10);
@@ -51,37 +55,66 @@ function adx(c,p=14){
   const t=mean(tr.slice(-p)), pdi=100*mean(plus.slice(-p))/Math.max(t,1e-12), mdi=100*mean(minus.slice(-p))/Math.max(t,1e-12); return 100*Math.abs(pdi-mdi)/Math.max(pdi+mdi,1e-12);
 }
 function sigmoid(x){return 1/(1+Math.exp(-x));}
-function scoreSignal(s){
-  const c=s.candles, prices=c.map(x=>x.c), vols=c.map(x=>x.v); const px=prices.at(-1);
+function resampleCandles(candles, bucketMs){
+  const out=[]; let cur=null;
+  for(const x of candles){
+    const t=Math.floor(x.t/bucketMs)*bucketMs;
+    if(!cur || cur.t!==t){ if(cur) out.push(cur); cur={t,o:x.o,h:x.h,l:x.l,c:x.c,v:x.v}; }
+    else { cur.h=Math.max(cur.h,x.h); cur.l=Math.min(cur.l,x.l); cur.c=x.c; cur.v+=x.v; }
+  }
+  if(cur) out.push(cur);
+  return out;
+}
+function tfAnalysis(c){
+  const prices=c.map(x=>x.c), vols=c.map(x=>x.v), px=prices.at(-1);
   const e20=ema(prices,20),e50=ema(prices,50),e200=ema(prices,200),r=rsi(prices),a=atr(c),ad=adx(c);
   if([e20,e50,e200,r,a,ad].some(x=>x==null)) return null;
-  const atrPct=a/px*100, volBase=mean(vols.slice(-21,-1))||1, volRatio=vols.at(-1)/volBase;
-  const returns=prices.slice(-30).map((x,i,a)=>i?Math.log(x/a[i-1]):0).slice(1); const vol=stdev(returns);
-  const mom=(prices.at(-1)-prices.at(-6))/prices.at(-6);
-  const body=Math.abs(c.at(-1).c-c.at(-1).o), range=Math.max(c.at(-1).h-c.at(-1).l,1e-12), bodyRatio=body/range;
+  const volBase=mean(vols.slice(-21,-1))||1, volRatio=vols.at(-1)/volBase;
+  const mom5=(px-prices.at(-6))/prices.at(-6);
+  const mom10=(px-prices.at(-11))/prices.at(-11);
   const trendUp=e20>e50&&e50>e200, trendDn=e20<e50&&e50<e200;
   const slope=(e20-ema(prices.slice(0,-5),20))/Math.max(px,1e-12);
-  const breakoutUp=px>Math.max(...c.slice(-21,-1).map(x=>x.h));
-  const breakoutDn=px<Math.min(...c.slice(-21,-1).map(x=>x.l));
-  const extension=Math.abs(px-e20)/Math.max(a,1e-12);
-  if(atrPct>6 || volRatio<0.35 || extension>3.5) return {direction:'NONE',score:0,reason:'unsafe_conditions'};
+  const last=c.at(-1), body=Math.abs(last.c-last.o), range=Math.max(last.h-last.l,1e-12), bodyRatio=body/range;
+  const prevHigh=Math.max(...c.slice(-21,-1).map(x=>x.h));
+  const prevLow=Math.min(...c.slice(-21,-1).map(x=>x.l));
+  const breakoutUp=px>prevHigh, breakoutDn=px<prevLow;
+  const pullbackUp=last.l<=e20 && px>e20;
+  const pullbackDn=last.h>=e20 && px<e20;
   let up=0,dn=0;
-  up += trendUp?22:0; dn += trendDn?22:0;
-  up += r>=52&&r<=68?14: r>68?0:6; dn += r<=48&&r>=32?14: r<32?0:6;
-  up += ad>=20?12:0; dn += ad>=20?12:0;
-  up += mom>0?10:0; dn += mom<0?10:0;
-  up += slope>0?8:0; dn += slope<0?8:0;
-  up += breakoutUp?10:0; dn += breakoutDn?10:0;
-  up += c.at(-1).c>c.at(-1).o&&bodyRatio>0.45?8:0; dn += c.at(-1).c<c.at(-1).o&&bodyRatio>0.45?8:0;
-  up += volRatio>=1.25?8:0; dn += volRatio>=1.25?8:0;
-  if(extension>1.8){up-=10;dn-=10;}
-  const direction=up>dn?'UP':dn>up?'DOWN':'NONE'; const raw=Math.max(up,dn); const confidence=clamp(Math.round(raw),0,100);
-  if(direction==='NONE'||confidence<MIN_SCORE) return {direction:'NONE',score:confidence,reason:'insufficient_confirmation'};
-  const sec=clamp(Math.round(12 + 40*sigmoid((Math.abs(mom)*100-0.15)/0.35) + 8*clamp(vol/0.01,0,2)),10,90);
-  const invalidation=a*1.1; const tp=a*1.4;
-  return {direction,score:confidence,horizonSec:sec,price:px,sl:direction==='UP'?px-invalidation:px+invalidation,tp:direction==='UP'?px+tp:px-tp,atrPct,volRatio,r,ad,mom,reason:'multi-factor confirmation'};
+  if(trendUp)up+=25; if(trendDn)dn+=25;
+  if(r>=52&&r<=67)up+=12; else if(r>70)up-=8; else if(r>50)up+=5;
+  if(r<=48&&r>=33)dn+=12; else if(r<30)dn-=8; else if(r<50)dn+=5;
+  if(ad>=MIN_ADX){ if(trendUp)up+=12; if(trendDn)dn+=12; }
+  if(mom5>0&&mom10>0)up+=10; if(mom5<0&&mom10<0)dn+=10;
+  if(slope>0)up+=8; if(slope<0)dn+=8;
+  if(pullbackUp)up+=10; if(pullbackDn)dn+=10;
+  if(breakoutUp)up+=6; if(breakoutDn)dn+=6;
+  if(last.c>last.o&&bodyRatio>=0.55)up+=7; if(last.c<last.o&&bodyRatio>=0.55)dn+=7;
+  if(volRatio>=1.15){ if(last.c>last.o)up+=5; if(last.c<last.o)dn+=5; }
+  const gap=Math.abs(up-dn), direction=up>dn?'UP':dn>up?'DOWN':'NONE';
+  return {px,e20,e50,e200,r,a,ad,volRatio,mom5,mom10,slope,bodyRatio,up,dn,gap,direction,atrPct:a/px*100};
 }
-
+function scoreSignal(s){
+  const one=resampleCandles(s.candles,60000);
+  const five=resampleCandles(s.candles,300000);
+  const a1=tfAnalysis(one), a5=tfAnalysis(five);
+  if(!a1||!a5) return null;
+  // The old version accidentally analyzed 1-second candles. That made EMA200,
+  // RSI and ATR react to seconds instead of real market time. V13 uses real 1m
+  // candles plus 5m confirmation, which is much harder to fool with noise.
+  if(a1.direction==='NONE'||a5.direction==='NONE'||a1.direction!==a5.direction) return {direction:'NONE',score:0,reason:'timeframe_conflict'};
+  if(a1.gap<MIN_DIRECTION_GAP||a5.gap<MIN_DIRECTION_GAP) return {direction:'NONE',score:0,reason:'weak_direction_gap'};
+  if(a1.ad<MIN_ADX||a5.ad<MIN_ADX) return {direction:'NONE',score:0,reason:'weak_trend'};
+  if(a1.atrPct>5||a5.atrPct>8) return {direction:'NONE',score:0,reason:'excessive_volatility'};
+  const confidence=clamp(Math.round((Math.max(a1.up,a1.dn)*0.65)+(Math.max(a5.up,a5.dn)*0.35)),0,100);
+  if(confidence<MIN_SCORE) return {direction:'NONE',score:confidence,reason:'insufficient_confirmation'};
+  const px=a1.px, a=a1.a;
+  const mom=Math.abs(a1.mom5);
+  const horizonSec=clamp(Math.round(30+90*sigmoid((mom*100-0.12)/0.25)),30,120);
+  const slDist=Math.min(a*MAX_SL_ATR,a*1.15);
+  const tpDist=a*2.0;
+  return {direction:a1.direction,score:confidence,horizonSec,price:px,sl:a1.direction==='UP'?px-slDist:px+slDist,tp:a1.direction==='UP'?px+tpDist:px-tpDist,atrPct:a1.atrPct,volRatio:a1.volRatio,r:a1.r,ad:a1.ad,mom:a1.mom5,reason:'1m trend + 5m confirmation', tf1:a1,tf5:a5};
+}
 async function signedBinance(method, path, params={}) {
   const timestamp = Date.now();
   const query = new URLSearchParams({...params, timestamp: String(timestamp), recvWindow:'5000'}).toString();
@@ -118,33 +151,24 @@ function floorStep(q,step){ if(!step||step<=0)return q; return Math.floor(q/step
 function decimals(step){ if(!step)return 8; const s=String(step); return s.includes('.') ? s.split('.')[1].replace(/0+$/,'').length : 0; }
 
 function chooseTargetPlan(sig){
-  // Target mode: aim for x2 total (100% net on margin) when the market can
-  // plausibly deliver it. Otherwise trade only when a smaller positive target
-  // is realistically reachable, using the maximum plausible ATR move.
-  const atrAbs=Math.abs(sig.price*sig.atrPct/100);
-  const maxMovePct=(atrAbs/Math.max(sig.price,1e-12))*MAX_TARGET_ATR;
+  const a=sig.tf1?.a||Math.abs(sig.price*sig.atrPct/100);
+  const maxMovePct=(a/Math.max(sig.price,1e-12))*MAX_TARGET_ATR;
   const feeRoundTrip=2*FEE_RATE;
-  let leverage=BASE_LEVERAGE;
-  let achievable=(leverage*maxMovePct)-(leverage*feeRoundTrip);
-  if(achievable < TARGET_PROFIT_MULTIPLE){
-    for(let l=Math.ceil(BASE_LEVERAGE); l<=MAX_TARGET_LEVERAGE; l++){
-      const net=(l*maxMovePct)-(l*feeRoundTrip);
-      if(net>achievable) { leverage=l; achievable=net; }
-      if(net>=TARGET_PROFIT_MULTIPLE) break;
-    }
-  }
-  // Only reject opportunities that are not expected to be profitable AFTER
-  // round-trip fees. Smaller positive opportunities are allowed; x2 remains
-  // the target when the market can support it, otherwise the bot lets the
-  // trade target the maximum plausible positive move.
-  if(achievable <= 0) return null;
-  const effectiveTargetMultiple=Math.min(TARGET_PROFIT_MULTIPLE, achievable);
-  const requiredMovePct=(effectiveTargetMultiple/leverage)+feeRoundTrip;
-  const targetMovePct=Math.min(maxMovePct, requiredMovePct);
+  // Never manufacture a trade just to reach x2. Leverage is fixed at the base
+  // setting; a setup must already have enough expected movement to be net positive.
+  const leverage=BASE_LEVERAGE;
+  const achievable=leverage*(maxMovePct-feeRoundTrip);
+  if(achievable<=0) return null;
+  const slMove=Math.abs(sig.price-sig.sl)/sig.price;
+  const rewardRisk=maxMovePct/Math.max(slMove,1e-12);
+  if(rewardRisk<MIN_RR) return null;
+  const targetMultiple=Math.min(TARGET_PROFIT_MULTIPLE,achievable);
+  const requiredMovePct=(targetMultiple/leverage)+feeRoundTrip;
+  const targetMovePct=Math.min(maxMovePct,requiredMovePct);
+  if(targetMovePct<=feeRoundTrip) return null;
   const targetPrice=sig.direction==='UP'?sig.price*(1+targetMovePct):sig.price*(1-targetMovePct);
-  return {leverage,requiredMovePct,targetMovePct,maxMovePct,achievableMultiple:achievable,effectiveTargetMultiple,targetPrice};
+  return {leverage,requiredMovePct,targetMovePct,maxMovePct,achievableMultiple:achievable,effectiveTargetMultiple:targetMultiple,targetPrice,rewardRisk};
 }
-
 async function executeEntry(symbol,sig){
   if(!LIVE_TRADING) throw new Error('Trading désactivé: LIVE_TRADING_ENABLED=false');
   const meta=await getSymbolMeta(symbol);
@@ -197,10 +221,12 @@ async function monitorTrade(symbol, tick){
     // protect the gain and let the move continue toward x2 or beyond.
     const grossPnl=trade.direction==='UP'?(tick.p-trade.entryPrice)*trade.executedQty:(trade.entryPrice-tick.p)*trade.executedQty;
     const currentMultiple=1+(grossPnl/TRADE_USDT);
+    if(trade.direction==='UP') trade.peakPrice=Math.max(trade.peakPrice,tick.p); else trade.peakPrice=Math.min(trade.peakPrice,tick.p);
     if(currentMultiple >= 1+TRAIL_START_MULTIPLE){
       const trailPnl=TRADE_USDT*TRAIL_GIVEBACK_MULTIPLE;
       const trailDistance=trailPnl/Math.max(trade.executedQty,1e-12);
-      const newSl=trade.direction==='UP'?tick.p-trailDistance:tick.p+trailDistance;
+      const anchor=trade.peakPrice;
+      const newSl=trade.direction==='UP'?anchor-trailDistance:anchor+trailDistance;
       if(trade.direction==='UP') trade.sl=Math.max(trade.sl,newSl);
       else trade.sl=Math.min(trade.sl,newSl);
     }
@@ -268,9 +294,9 @@ bot.action(/^trade:(.+)$/, async ctx=>{
     const entryPrice=Number(order.avgPrice||0) || (totalQty&&totalCost?totalCost/totalQty:p.s.price);
     const plan=order.plan;
     const targetPrice=plan.targetPrice;
-    const trade={id,symbol:p.symbol,direction:p.s.direction,entryPrice,executedQty:totalQty,openedAt:Date.now(),horizonMs:Math.max(p.s.horizonSec*1000,15000),tp:targetPrice,sl:p.s.sl,lastPrice:entryPrice,closed:false,leverage:plan.leverage,targetMultiple:1+TARGET_PROFIT_MULTIPLE};
+    const trade={id,symbol:p.symbol,direction:p.s.direction,entryPrice,executedQty:totalQty,openedAt:Date.now(),horizonMs:Math.max(p.s.horizonSec*1000,30000),tp:targetPrice,sl:p.s.sl,lastPrice:entryPrice,closed:false,leverage:plan.leverage,targetMultiple:1+plan.effectiveTargetMultiple,peakPrice:entryPrice};
     activeTrades.set(id,trade);
-    await ctx.reply(`💰 <b>FUTURES OUVERT</b>\n\n${p.s.direction==='UP'?'🟢 LONG':'🔴 SHORT'} — ${p.symbol}\n💵 Marge: ${TRADE_USDT} USDT\n⚙️ Levier: ${plan.leverage}x\n📍 Entrée: ${entryPrice}\n🎯 Objectif visé: x${(1+plan.effectiveTargetMultiple).toFixed(2)} — ${targetPrice}\n🛑 SL: ${p.s.sl}\n⏱️ Horizon max: ${Math.max(p.s.horizonSec,15)}s\n🪝 Trailing: activé\n\n🔄 Fermeture automatique activée.`,{parse_mode:'HTML'});
+    await ctx.reply(`💰 <b>FUTURES OUVERT</b>\n\n${p.s.direction==='UP'?'🟢 LONG':'🔴 SHORT'} — ${p.symbol}\n💵 Marge: ${TRADE_USDT} USDT\n⚙️ Levier: ${plan.leverage}x\n📍 Entrée: ${entryPrice}\n🎯 Objectif visé: x${(1+plan.effectiveTargetMultiple).toFixed(2)} | R/R ${plan.rewardRisk.toFixed(2)} — ${targetPrice}\n🛑 SL: ${p.s.sl}\n⏱️ Horizon max: ${Math.max(p.s.horizonSec,15)}s\n🪝 Trailing: activé\n\n🔄 Fermeture automatique activée.`,{parse_mode:'HTML'});
   } catch(err) {
     p.used=false;
     await ctx.reply(`❌ TRADE refusé / échoué\n\n${p.symbol}\n${err.message}`);
@@ -290,7 +316,7 @@ function connect(){
 }
 
 bot.start(ctx=>ctx.reply('🛡️ TradeGuard Live actif.\n\n/signals — état du moteur\n/pause — désactiver les alertes\n/resume — réactiver les alertes\n\nLes signaux sont envoyés automatiquement.'));
-bot.command('signals',ctx=>ctx.reply(`🧠 Moteur LIVE\nScore minimum: ${MIN_SCORE}/100\nCooldown: ${COOLDOWN_MS/1000}s\nLimite: ${MAX_ALERTS_HOUR}/h\nEnvoi: automatique\nMode: Binance Futures\nTrading réel: ${LIVE_TRADING?'ACTIF':'DÉSACTIVÉ'}\nTaille: ${TRADE_USDT} USDT\nLevier de base: ${BASE_LEVERAGE}x\nLevier cible max: ${MAX_TARGET_LEVERAGE}x\nObjectif: x${(1+TARGET_PROFIT_MULTIPLE).toFixed(2)}\nTrailing: actif`));
+bot.command('signals',ctx=>ctx.reply(`🧠 Moteur LIVE\nScore minimum: ${MIN_SCORE}/100\nGap direction: ${MIN_DIRECTION_GAP}\nADX minimum: ${MIN_ADX}\nR/R minimum: ${MIN_RR}\nCooldown: ${COOLDOWN_MS/1000}s\nLimite: ${MAX_ALERTS_HOUR}/h\nEnvoi: automatique\nMode: Binance Futures\nTrading réel: ${LIVE_TRADING?'ACTIF':'DÉSACTIVÉ'}\nTaille: ${TRADE_USDT} USDT\nLevier de base: ${BASE_LEVERAGE}x\nLevier cible max: ${MAX_TARGET_LEVERAGE}x\nObjectif: x${(1+TARGET_PROFIT_MULTIPLE).toFixed(2)}\nTrailing: actif`));
 bot.command('test',ctx=>ctx.reply('🧪 TradeGuard OK — Telegram est bien connecté.\n\nLe moteur LIVE est actif et prêt à envoyer les alertes.'));
 bot.command('pause',ctx=>{paused=true;ctx.reply('⏸️ Alertes suspendues.');});
 bot.command('resume',ctx=>{paused=false;ctx.reply('▶️ Alertes réactivées.');});
