@@ -86,16 +86,24 @@ async function signedBinance(method, path, params={}) {
   return data;
 }
 
-const symbolMeta = new Map();
+// Avoid Futures /exchangeInfo because some hosting IPs (including Railway) can receive HTTP 451.
+// Conservative quantity steps for the symbols used by TradeGuard.
+const symbolMeta = new Map([
+  ['BTCUSDT',{status:'TRADING',stepSize:0.001,minQty:0.001}],
+  ['ETHUSDT',{status:'TRADING',stepSize:0.01,minQty:0.01}],
+  ['SOLUSDT',{status:'TRADING',stepSize:0.1,minQty:0.1}],
+  ['BNBUSDT',{status:'TRADING',stepSize:0.01,minQty:0.01}],
+  ['XRPUSDT',{status:'TRADING',stepSize:1,minQty:1}],
+  ['DOGEUSDT',{status:'TRADING',stepSize:1,minQty:1}],
+  ['ADAUSDT',{status:'TRADING',stepSize:1,minQty:1}],
+  ['AVAXUSDT',{status:'TRADING',stepSize:0.1,minQty:0.1}],
+  ['LINKUSDT',{status:'TRADING',stepSize:0.1,minQty:0.1}],
+  ['SUIUSDT',{status:'TRADING',stepSize:1,minQty:1}]
+]);
 async function getSymbolMeta(symbol){
-  if(symbolMeta.has(symbol)) return symbolMeta.get(symbol);
-  const res=await fetch(`${BINANCE_BASE}/fapi/v1/exchangeInfo`);
-  if(!res.ok) throw new Error(`Futures exchangeInfo ${res.status}`);
-  const data=await res.json(); const info=data.symbols?.find(x=>x.symbol===symbol);
-  if(!info) throw new Error(`Unknown Futures symbol ${symbol}`);
-  const filters=Object.fromEntries((info.filters||[]).map(f=>[f.filterType,f]));
-  const meta={status:info.status,stepSize:Number(filters.LOT_SIZE?.stepSize||0),minQty:Number(filters.LOT_SIZE?.minQty||0)};
-  symbolMeta.set(symbol,meta); return meta;
+  const meta=symbolMeta.get(symbol);
+  if(!meta) throw new Error(`Symbole ${symbol} non configuré`);
+  return meta;
 }
 async function setLeverage(symbol){ return signedBinance('POST','/fapi/v1/leverage',{symbol,leverage:String(LEVERAGE)}); }
 function floorStep(q,step){ if(!step||step<=0)return q; return Math.floor(q/step)*step; }
@@ -224,6 +232,6 @@ bot.command('pause',ctx=>{paused=true;ctx.reply('⏸️ Alertes suspendues.');})
 bot.command('resume',ctx=>{paused=false;ctx.reply('▶️ Alertes réactivées.');});
 bot.launch().then(()=>console.log('Telegram bot polling started')).catch(err=>console.error('Telegram launch error:',err.message));
 connect();
-console.log('TradeGuard Live V6 Futures started');
+console.log('TradeGuard Live V8 Futures Demo started');
 process.once('SIGINT',()=>bot.stop('SIGINT'));
 process.once('SIGTERM',()=>bot.stop('SIGTERM'));
