@@ -1,0 +1,8 @@
+{
+  "name":"tradeguard-live-v3",
+  "version":"3.0.0",
+  "private":true,
+  "type":"module",
+  "scripts":{"start":"node server.js"},
+  "dependencies":{"dotenv":"^16.4.5","ws":"^8.18.0","telegraf":"^4.16.3"}
+}
