@@ -12,8 +12,9 @@ const COOLDOWN_MS = Number(process.env.COOLDOWN_SECONDS || 10) * 1000;
 const MAX_ALERTS_HOUR = Number(process.env.MAX_ALERTS_PER_HOUR || 20);
 const TRADE_USDT = Number(process.env.TRADE_USDT || 10);
 const LIVE_TRADING = String(process.env.LIVE_TRADING_ENABLED || 'false').toLowerCase() === 'true';
-const DEMO_TRADING = String(process.env.BINANCE_DEMO_TRADING || 'true').toLowerCase() === 'true';
-const BINANCE_BASE = process.env.BINANCE_FUTURES_API_BASE || (DEMO_TRADING ? 'https://demo-fapi.binance.com' : 'https://fapi.binance.com');
+const DEMO_TRADING = String(process.env.BINANCE_DEMO_TRADING || 'false').toLowerCase() === 'true';
+const TESTNET_TRADING = String(process.env.BINANCE_FUTURES_TESTNET || 'true').toLowerCase() === 'true';
+const BINANCE_BASE = process.env.BINANCE_FUTURES_API_BASE || (TESTNET_TRADING ? 'https://testnet.binancefuture.com' : (DEMO_TRADING ? 'https://demo-fapi.binance.com' : 'https://fapi.binance.com'));
 const LEVERAGE = Math.max(1, Math.min(Number(process.env.FUTURES_LEVERAGE || 1), 20));
 const SIGNAL_TTL_MS = Number(process.env.SIGNAL_TTL_SECONDS || 30) * 1000;
 let paused = false;
@@ -21,7 +22,7 @@ let paused = false;
 const API_KEY = process.env.BINANCE_API_KEY || '';
 const API_SECRET = process.env.BINANCE_API_SECRET || '';
 if (API_KEY && API_SECRET) console.log('✅ Binance API credentials detected');
-console.log(`⚙️ Demo Futures: ${DEMO_TRADING} | Trading enabled: ${LIVE_TRADING} | Trade size: ${TRADE_USDT} USDT`);
+console.log(`⚙️ Futures Testnet: ${TESTNET_TRADING} | Demo Futures: ${DEMO_TRADING} | Trading enabled: ${LIVE_TRADING} | Trade size: ${TRADE_USDT} USDT`);
 if (LIVE_TRADING && (!API_KEY || !API_SECRET)) throw new Error('LIVE_TRADING_ENABLED=true but Binance API credentials are missing');
 
 const state = new Map();
@@ -110,7 +111,7 @@ function floorStep(q,step){ if(!step||step<=0)return q; return Math.floor(q/step
 function decimals(step){ if(!step)return 8; const s=String(step); return s.includes('.') ? s.split('.')[1].replace(/0+$/,'').length : 0; }
 
 async function executeEntry(symbol,sig){
-  if(!LIVE_TRADING) throw new Error('Trading réel désactivé: LIVE_TRADING_ENABLED=false');
+  if(!LIVE_TRADING) throw new Error('Trading désactivé: LIVE_TRADING_ENABLED=false');
   const meta=await getSymbolMeta(symbol);
   if(meta.status!=='TRADING') throw new Error(`Symbole ${symbol} non disponible en Futures`);
   await setLeverage(symbol);
@@ -232,6 +233,6 @@ bot.command('pause',ctx=>{paused=true;ctx.reply('⏸️ Alertes suspendues.');})
 bot.command('resume',ctx=>{paused=false;ctx.reply('▶️ Alertes réactivées.');});
 bot.launch().then(()=>console.log('Telegram bot polling started')).catch(err=>console.error('Telegram launch error:',err.message));
 connect();
-console.log('TradeGuard Live V8 Futures Demo started');
+console.log('TradeGuard V9 Futures Testnet started');
 process.once('SIGINT',()=>bot.stop('SIGINT'));
 process.once('SIGTERM',()=>bot.stop('SIGTERM'));
