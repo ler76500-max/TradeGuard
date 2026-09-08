@@ -12,7 +12,8 @@ const COOLDOWN_MS = Number(process.env.COOLDOWN_SECONDS || 10) * 1000;
 const MAX_ALERTS_HOUR = Number(process.env.MAX_ALERTS_PER_HOUR || 20);
 const TRADE_USDT = Number(process.env.TRADE_USDT || 10);
 const LIVE_TRADING = String(process.env.LIVE_TRADING_ENABLED || 'false').toLowerCase() === 'true';
-const BINANCE_BASE = process.env.BINANCE_FUTURES_API_BASE || 'https://fapi.binance.com';
+const DEMO_TRADING = String(process.env.BINANCE_DEMO_TRADING || 'true').toLowerCase() === 'true';
+const BINANCE_BASE = process.env.BINANCE_FUTURES_API_BASE || (DEMO_TRADING ? 'https://demo-fapi.binance.com' : 'https://fapi.binance.com');
 const LEVERAGE = Math.max(1, Math.min(Number(process.env.FUTURES_LEVERAGE || 1), 20));
 const SIGNAL_TTL_MS = Number(process.env.SIGNAL_TTL_SECONDS || 30) * 1000;
 let paused = false;
@@ -20,7 +21,7 @@ let paused = false;
 const API_KEY = process.env.BINANCE_API_KEY || '';
 const API_SECRET = process.env.BINANCE_API_SECRET || '';
 if (API_KEY && API_SECRET) console.log('✅ Binance API credentials detected');
-console.log(`⚙️ Live trading enabled: ${LIVE_TRADING} | Trade size: ${TRADE_USDT} USDT`);
+console.log(`⚙️ Demo Futures: ${DEMO_TRADING} | Trading enabled: ${LIVE_TRADING} | Trade size: ${TRADE_USDT} USDT`);
 if (LIVE_TRADING && (!API_KEY || !API_SECRET)) throw new Error('LIVE_TRADING_ENABLED=true but Binance API credentials are missing');
 
 const state = new Map();
@@ -144,7 +145,8 @@ async function monitorTrade(symbol, tick){
     const s=state.get(symbol);
     if(s && s.candles.length>=210){
       const fresh=scoreSignal(s);
-      if(fresh && fresh.direction==='DOWN' && fresh.score>=60) return closeSpotLong(trade,'Retournement détecté');
+      const reversal = trade.direction==='UP' ? fresh?.direction==='DOWN' : fresh?.direction==='UP';
+      if(reversal && fresh.score>=60) return closeSpotLong(trade,'Retournement détecté');
     }
   }
 }
@@ -191,9 +193,9 @@ bot.action(/^trade:(.+)$/, async ctx=>{
     pendingSignals.delete(id);
     try { await ctx.editMessageReplyMarkup({inline_keyboard:[]}); } catch {}
     const fills=order.fills||[];
-    const totalQty=fills.reduce((a,f)=>a+Number(f.qty||0),0);
+    const totalQty=Number(order.executedQty||0) || fills.reduce((a,f)=>a+Number(f.qty||0),0);
     const totalCost=fills.reduce((a,f)=>a+Number(f.qty||0)*Number(f.price||0),0);
-    const entryPrice=totalQty?totalCost/totalQty:p.s.price;
+    const entryPrice=Number(order.avgPrice||0) || (totalQty&&totalCost?totalCost/totalQty:p.s.price);
     const trade={id,symbol:p.symbol,direction:p.s.direction,entryPrice,executedQty:totalQty,openedAt:Date.now(),horizonMs:p.s.horizonSec*1000,tp:p.s.tp,sl:p.s.sl,lastPrice:entryPrice,closed:false};
     activeTrades.set(id,trade);
     await ctx.reply(`💰 <b>FUTURES OUVERT</b>\n\n${p.s.direction==='UP'?'🟢 LONG':'🔴 SHORT'} — ${p.symbol}\n💵 Marge: ${TRADE_USDT} USDT\n⚙️ Levier: ${LEVERAGE}x\n📍 Entrée: ${entryPrice}\n🎯 TP: ${p.s.tp}\n🛑 SL: ${p.s.sl}\n⏱️ Horizon max: ${p.s.horizonSec}s\n\n🔄 Fermeture automatique activée.`,{parse_mode:'HTML'});
