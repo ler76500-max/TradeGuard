@@ -11,12 +11,18 @@ const MIN_SCORE = Number(process.env.MIN_SCORE || 50);
 const COOLDOWN_MS = Number(process.env.COOLDOWN_SECONDS || 10) * 1000;
 const MAX_ALERTS_HOUR = Number(process.env.MAX_ALERTS_PER_HOUR || 20);
 const TRADE_USDT = Number(process.env.TRADE_USDT || 10);
-const FEE_RATE = Number(process.env.FEE_RATE || 0.0005);
 const LIVE_TRADING = String(process.env.LIVE_TRADING_ENABLED || 'false').toLowerCase() === 'true';
 const DEMO_TRADING = String(process.env.BINANCE_DEMO_TRADING || 'false').toLowerCase() === 'true';
 const TESTNET_TRADING = String(process.env.BINANCE_FUTURES_TESTNET || 'true').toLowerCase() === 'true';
 const BINANCE_BASE = process.env.BINANCE_FUTURES_API_BASE || (TESTNET_TRADING ? 'https://testnet.binancefuture.com' : (DEMO_TRADING ? 'https://demo-fapi.binance.com' : 'https://fapi.binance.com'));
-const LEVERAGE = Math.max(1, Math.min(Number(process.env.FUTURES_LEVERAGE || 1), 20));
+const BASE_LEVERAGE = Math.max(1, Math.min(Number(process.env.FUTURES_LEVERAGE || 1), 20));
+const MAX_TARGET_LEVERAGE = Math.max(BASE_LEVERAGE, Math.min(Number(process.env.MAX_TARGET_LEVERAGE || 10), 20));
+const FEE_RATE = Number(process.env.FEE_RATE || 0.0005);
+// 1.0 = +100% net profit on margin (x2 total balance for that trade).
+const TARGET_PROFIT_MULTIPLE = Math.max(0, Number(process.env.TARGET_PROFIT_MULTIPLE || 1.0));
+const MAX_TARGET_ATR = Math.max(1.5, Number(process.env.MAX_TARGET_ATR || 3.0));
+const TRAIL_START_MULTIPLE = Math.max(0.25, Number(process.env.TRAIL_START_MULTIPLE || 0.5));
+const TRAIL_GIVEBACK_MULTIPLE = Math.max(0.15, Number(process.env.TRAIL_GIVEBACK_MULTIPLE || 0.35));
 const SIGNAL_TTL_MS = Number(process.env.SIGNAL_TTL_SECONDS || 30) * 1000;
 let paused = false;
 
@@ -107,22 +113,49 @@ async function getSymbolMeta(symbol){
   if(!meta) throw new Error(`Symbole ${symbol} non configuré`);
   return meta;
 }
-async function setLeverage(symbol){ return signedBinance('POST','/fapi/v1/leverage',{symbol,leverage:String(LEVERAGE)}); }
+async function setLeverage(symbol, leverage=BASE_LEVERAGE){ return signedBinance('POST','/fapi/v1/leverage',{symbol,leverage:String(leverage)}); }
 function floorStep(q,step){ if(!step||step<=0)return q; return Math.floor(q/step)*step; }
 function decimals(step){ if(!step)return 8; const s=String(step); return s.includes('.') ? s.split('.')[1].replace(/0+$/,'').length : 0; }
+
+function chooseTargetPlan(sig){
+  // Target mode: aim for x2 total (100% net on margin) when the market can
+  // plausibly deliver it. Otherwise trade only when a smaller positive target
+  // is realistically reachable, using the maximum plausible ATR move.
+  const atrAbs=Math.abs(sig.price*sig.atrPct/100);
+  const maxMovePct=(atrAbs/Math.max(sig.price,1e-12))*MAX_TARGET_ATR;
+  const feeRoundTrip=2*FEE_RATE;
+  let leverage=BASE_LEVERAGE;
+  let achievable=(leverage*maxMovePct)-(leverage*feeRoundTrip);
+  if(achievable < TARGET_PROFIT_MULTIPLE){
+    for(let l=Math.ceil(BASE_LEVERAGE); l<=MAX_TARGET_LEVERAGE; l++){
+      const net=(l*maxMovePct)-(l*feeRoundTrip);
+      if(net>achievable) { leverage=l; achievable=net; }
+      if(net>=TARGET_PROFIT_MULTIPLE) break;
+    }
+  }
+  // Ignore tiny opportunities that are unlikely to overcome execution noise.
+  if(achievable < 0.25) return null;
+  const effectiveTargetMultiple=Math.min(TARGET_PROFIT_MULTIPLE, achievable);
+  const requiredMovePct=(effectiveTargetMultiple/leverage)+feeRoundTrip;
+  const targetMovePct=Math.min(maxMovePct, requiredMovePct);
+  const targetPrice=sig.direction==='UP'?sig.price*(1+targetMovePct):sig.price*(1-targetMovePct);
+  return {leverage,requiredMovePct,targetMovePct,maxMovePct,achievableMultiple:achievable,effectiveTargetMultiple,targetPrice};
+}
 
 async function executeEntry(symbol,sig){
   if(!LIVE_TRADING) throw new Error('Trading désactivé: LIVE_TRADING_ENABLED=false');
   const meta=await getSymbolMeta(symbol);
   if(meta.status!=='TRADING') throw new Error(`Symbole ${symbol} non disponible en Futures`);
-  await setLeverage(symbol);
+  const plan=chooseTargetPlan(sig);
+  if(!plan) throw new Error('Pas de trade: mouvement potentiel trop faible après frais.');
+  await setLeverage(symbol, plan.leverage);
   const px=Number((await fetch(`${BINANCE_BASE}/fapi/v1/ticker/price?symbol=${symbol}`).then(r=>r.json())).price);
-  const qty=floorStep((TRADE_USDT*LEVERAGE)/px,meta.stepSize);
+  const qty=floorStep((TRADE_USDT*plan.leverage)/px,meta.stepSize);
   if(qty<meta.minQty) throw new Error(`Quantité trop faible pour ${symbol}. Augmente TRADE_USDT.`);
   const side=sig.direction==='UP'?'BUY':'SELL';
   const order=await signedBinance('POST','/fapi/v1/order',{symbol,side,type:'MARKET',quantity:qty.toFixed(decimals(meta.stepSize)),newOrderRespType:'RESULT'});
   if(order.status!=='FILLED' && Number(order.executedQty||0)<=0) throw new Error(`Ordre non exécuté: ${order.status||'unknown'}`);
-  return {order,entryPrice:Number(order.avgPrice||px),executedQty:Number(order.executedQty||qty),stepSize:meta.stepSize};
+  return {order,entryPrice:Number(order.avgPrice||px),executedQty:Number(order.executedQty||qty),plan};
 }
 
 async function closeSpotLong(trade,reason){
@@ -137,15 +170,16 @@ async function closeSpotLong(trade,reason){
     const notionalExit=exitPrice*trade.executedQty;
     const fees=(notionalEntry+notionalExit)*FEE_RATE;
     const pnlNet=pnlGross-fees;
-    const margin=TRADE_USDT;
-    const roi=margin>0?(pnlNet/margin)*100:0;
+    const roi=(pnlNet/TRADE_USDT)*100;
+    const multiple=1+(pnlNet/TRADE_USDT);
     trade.closed=true; activeTrades.delete(trade.id);
-    await bot.telegram.sendMessage(CHAT_ID,`🔔 <b>FUTURES FERMÉ</b>\n\n${trade.symbol}\n📌 Motif: <b>${reason}</b>\n📍 Entrée: ${trade.entryPrice}\n📍 Sortie: ${exitPrice}\n💵 Marge utilisée: <b>${margin.toFixed(2)} USDT</b>\n📈 P&L brut: <b>${pnlGross>=0?'+':''}${pnlGross.toFixed(4)} USDT</b>\n💸 Frais estimés: <b>${fees.toFixed(4)} USDT</b>\n💰 <b>Résultat net estimé: ${pnlNet>=0?'+':''}${pnlNet.toFixed(4)} USDT</b>\n📊 ROI sur marge: <b>${roi>=0?'+':''}${roi.toFixed(2)}%</b>`,{parse_mode:'HTML'}).catch(()=>{});
+    await bot.telegram.sendMessage(CHAT_ID,`🔔 <b>FUTURES FERMÉ</b>\n\n${trade.symbol}\n📌 Motif: <b>${reason}</b>\n📍 Entrée: ${trade.entryPrice}\n📍 Sortie: ${exitPrice}\n💵 Marge: ${TRADE_USDT.toFixed(2)} USDT\n⚙️ Levier: ${trade.leverage}x\n📈 P&L brut: <b>${pnlGross>=0?'+':''}${pnlGross.toFixed(4)} USDT</b>\n💸 Frais estimés: ${fees.toFixed(4)} USDT\n💰 Net estimé: <b>${pnlNet>=0?'+':''}${pnlNet.toFixed(4)} USDT</b>\n📊 ROI marge: <b>${roi>=0?'+':''}${roi.toFixed(2)}%</b>\n✖️ Multiplicateur: <b>x${multiple.toFixed(2)}</b>`,{parse_mode:'HTML'}).catch(()=>{});
   }catch(err){
     trade.closing=false; console.error(`❌ Futures close error ${trade.symbol}:`,err.message);
     await bot.telegram.sendMessage(CHAT_ID,`🚨 <b>ERREUR FERMETURE FUTURES</b>\n\n${trade.symbol}\n${err.message}\n\n⚠️ Vérifie immédiatement la position sur Binance.`,{parse_mode:'HTML'}).catch(()=>{});
   }
 }
+
 async function monitorTrade(symbol, tick){
   for(const trade of activeTrades.values()){
     if(trade.symbol!==symbol || trade.closed) continue;
@@ -155,6 +189,18 @@ async function monitorTrade(symbol, tick){
     if(trade.direction==='UP' && tick.p<=trade.sl) return closeSpotLong(trade,'Stop Loss');
     if(trade.direction==='DOWN' && tick.p<=trade.tp) return closeSpotLong(trade,'Take Profit');
     if(trade.direction==='DOWN' && tick.p>=trade.sl) return closeSpotLong(trade,'Stop Loss');
+
+    // Trailing profit: once a meaningful fraction of the target is reached,
+    // protect the gain and let the move continue toward x2 or beyond.
+    const grossPnl=trade.direction==='UP'?(tick.p-trade.entryPrice)*trade.executedQty:(trade.entryPrice-tick.p)*trade.executedQty;
+    const currentMultiple=1+(grossPnl/TRADE_USDT);
+    if(currentMultiple >= 1+TRAIL_START_MULTIPLE){
+      const trailPnl=TRADE_USDT*TRAIL_GIVEBACK_MULTIPLE;
+      const trailDistance=trailPnl/Math.max(trade.executedQty,1e-12);
+      const newSl=trade.direction==='UP'?tick.p-trailDistance:tick.p+trailDistance;
+      if(trade.direction==='UP') trade.sl=Math.max(trade.sl,newSl);
+      else trade.sl=Math.min(trade.sl,newSl);
+    }
     if(age>=trade.horizonMs) return closeSpotLong(trade,'Fin de l’horizon');
     // Sortie anticipée: si une nouvelle analyse forte indique un retournement.
     const s=state.get(symbol);
@@ -214,9 +260,11 @@ bot.action(/^trade:(.+)$/, async ctx=>{
     const totalQty=Number(order.executedQty||0) || fills.reduce((a,f)=>a+Number(f.qty||0),0);
     const totalCost=fills.reduce((a,f)=>a+Number(f.qty||0)*Number(f.price||0),0);
     const entryPrice=Number(order.avgPrice||0) || (totalQty&&totalCost?totalCost/totalQty:p.s.price);
-    const trade={id,symbol:p.symbol,direction:p.s.direction,entryPrice,executedQty:totalQty,openedAt:Date.now(),horizonMs:p.s.horizonSec*1000,tp:p.s.tp,sl:p.s.sl,lastPrice:entryPrice,closed:false};
+    const plan=order.plan;
+    const targetPrice=plan.targetPrice;
+    const trade={id,symbol:p.symbol,direction:p.s.direction,entryPrice,executedQty:totalQty,openedAt:Date.now(),horizonMs:Math.max(p.s.horizonSec*1000,15000),tp:targetPrice,sl:p.s.sl,lastPrice:entryPrice,closed:false,leverage:plan.leverage,targetMultiple:1+TARGET_PROFIT_MULTIPLE};
     activeTrades.set(id,trade);
-    await ctx.reply(`💰 <b>FUTURES OUVERT</b>\n\n${p.s.direction==='UP'?'🟢 LONG':'🔴 SHORT'} — ${p.symbol}\n💵 Marge: ${TRADE_USDT} USDT\n⚙️ Levier: ${LEVERAGE}x\n📍 Entrée: ${entryPrice}\n🎯 TP: ${p.s.tp}\n🛑 SL: ${p.s.sl}\n⏱️ Horizon max: ${p.s.horizonSec}s\n\n🔄 Fermeture automatique activée.`,{parse_mode:'HTML'});
+    await ctx.reply(`💰 <b>FUTURES OUVERT</b>\n\n${p.s.direction==='UP'?'🟢 LONG':'🔴 SHORT'} — ${p.symbol}\n💵 Marge: ${TRADE_USDT} USDT\n⚙️ Levier: ${plan.leverage}x\n📍 Entrée: ${entryPrice}\n🎯 Objectif visé: x${(1+plan.effectiveTargetMultiple).toFixed(2)} — ${targetPrice}\n🛑 SL: ${p.s.sl}\n⏱️ Horizon max: ${Math.max(p.s.horizonSec,15)}s\n🪝 Trailing: activé\n\n🔄 Fermeture automatique activée.`,{parse_mode:'HTML'});
   } catch(err) {
     p.used=false;
     await ctx.reply(`❌ TRADE refusé / échoué\n\n${p.symbol}\n${err.message}`);
@@ -236,7 +284,7 @@ function connect(){
 }
 
 bot.start(ctx=>ctx.reply('🛡️ TradeGuard Live actif.\n\n/signals — état du moteur\n/pause — désactiver les alertes\n/resume — réactiver les alertes\n\nLes signaux sont envoyés automatiquement.'));
-bot.command('signals',ctx=>ctx.reply(`🧠 Moteur LIVE\nScore minimum: ${MIN_SCORE}/100\nCooldown: ${COOLDOWN_MS/1000}s\nLimite: ${MAX_ALERTS_HOUR}/h\nEnvoi: automatique\nMode: Binance Futures\nTrading réel: ${LIVE_TRADING?'ACTIF':'DÉSACTIVÉ'}\nTaille: ${TRADE_USDT} USDT\nLevier: ${LEVERAGE}x`));
+bot.command('signals',ctx=>ctx.reply(`🧠 Moteur LIVE\nScore minimum: ${MIN_SCORE}/100\nCooldown: ${COOLDOWN_MS/1000}s\nLimite: ${MAX_ALERTS_HOUR}/h\nEnvoi: automatique\nMode: Binance Futures\nTrading réel: ${LIVE_TRADING?'ACTIF':'DÉSACTIVÉ'}\nTaille: ${TRADE_USDT} USDT\nLevier de base: ${BASE_LEVERAGE}x\nLevier cible max: ${MAX_TARGET_LEVERAGE}x\nObjectif: x${(1+TARGET_PROFIT_MULTIPLE).toFixed(2)}\nTrailing: actif`));
 bot.command('test',ctx=>ctx.reply('🧪 TradeGuard OK — Telegram est bien connecté.\n\nLe moteur LIVE est actif et prêt à envoyer les alertes.'));
 bot.command('pause',ctx=>{paused=true;ctx.reply('⏸️ Alertes suspendues.');});
 bot.command('resume',ctx=>{paused=false;ctx.reply('▶️ Alertes réactivées.');});
