@@ -11,6 +11,7 @@ const MIN_SCORE = Number(process.env.MIN_SCORE || 50);
 const COOLDOWN_MS = Number(process.env.COOLDOWN_SECONDS || 10) * 1000;
 const MAX_ALERTS_HOUR = Number(process.env.MAX_ALERTS_PER_HOUR || 20);
 const TRADE_USDT = Number(process.env.TRADE_USDT || 10);
+const FEE_RATE = Number(process.env.FEE_RATE || 0.0005);
 const LIVE_TRADING = String(process.env.LIVE_TRADING_ENABLED || 'false').toLowerCase() === 'true';
 const DEMO_TRADING = String(process.env.BINANCE_DEMO_TRADING || 'false').toLowerCase() === 'true';
 const TESTNET_TRADING = String(process.env.BINANCE_FUTURES_TESTNET || 'true').toLowerCase() === 'true';
@@ -121,7 +122,7 @@ async function executeEntry(symbol,sig){
   const side=sig.direction==='UP'?'BUY':'SELL';
   const order=await signedBinance('POST','/fapi/v1/order',{symbol,side,type:'MARKET',quantity:qty.toFixed(decimals(meta.stepSize)),newOrderRespType:'RESULT'});
   if(order.status!=='FILLED' && Number(order.executedQty||0)<=0) throw new Error(`Ordre non exécuté: ${order.status||'unknown'}`);
-  return {order,entryPrice:Number(order.avgPrice||px),executedQty:Number(order.executedQty||qty)};
+  return {order,entryPrice:Number(order.avgPrice||px),executedQty:Number(order.executedQty||qty),stepSize:meta.stepSize};
 }
 
 async function closeSpotLong(trade,reason){
@@ -131,15 +132,20 @@ async function closeSpotLong(trade,reason){
     const qtyStr=trade.executedQty.toFixed(decimals(trade.stepSize));
     const order=await signedBinance('POST','/fapi/v1/order',{symbol:trade.symbol,side,type:'MARKET',quantity:qtyStr,reduceOnly:'true',newOrderRespType:'RESULT'});
     const exitPrice=Number(order.avgPrice||trade.lastPrice);
-    const pnl=trade.direction==='UP'?(exitPrice-trade.entryPrice)*trade.executedQty:(trade.entryPrice-exitPrice)*trade.executedQty;
+    const pnlGross=trade.direction==='UP'?(exitPrice-trade.entryPrice)*trade.executedQty:(trade.entryPrice-exitPrice)*trade.executedQty;
+    const notionalEntry=trade.entryPrice*trade.executedQty;
+    const notionalExit=exitPrice*trade.executedQty;
+    const fees=(notionalEntry+notionalExit)*FEE_RATE;
+    const pnlNet=pnlGross-fees;
+    const margin=TRADE_USDT;
+    const roi=margin>0?(pnlNet/margin)*100:0;
     trade.closed=true; activeTrades.delete(trade.id);
-    await bot.telegram.sendMessage(CHAT_ID,`🔔 <b>FUTURES FERMÉ</b>\n\n${trade.symbol}\n📌 Motif: <b>${reason}</b>\n📍 Entrée: ${trade.entryPrice}\n📍 Sortie: ${exitPrice}\n📈 P&L brut estimé: <b>${pnl.toFixed(4)} USDT</b>`,{parse_mode:'HTML'}).catch(()=>{});
+    await bot.telegram.sendMessage(CHAT_ID,`🔔 <b>FUTURES FERMÉ</b>\n\n${trade.symbol}\n📌 Motif: <b>${reason}</b>\n📍 Entrée: ${trade.entryPrice}\n📍 Sortie: ${exitPrice}\n💵 Marge utilisée: <b>${margin.toFixed(2)} USDT</b>\n📈 P&L brut: <b>${pnlGross>=0?'+':''}${pnlGross.toFixed(4)} USDT</b>\n💸 Frais estimés: <b>${fees.toFixed(4)} USDT</b>\n💰 <b>Résultat net estimé: ${pnlNet>=0?'+':''}${pnlNet.toFixed(4)} USDT</b>\n📊 ROI sur marge: <b>${roi>=0?'+':''}${roi.toFixed(2)}%</b>`,{parse_mode:'HTML'}).catch(()=>{});
   }catch(err){
     trade.closing=false; console.error(`❌ Futures close error ${trade.symbol}:`,err.message);
     await bot.telegram.sendMessage(CHAT_ID,`🚨 <b>ERREUR FERMETURE FUTURES</b>\n\n${trade.symbol}\n${err.message}\n\n⚠️ Vérifie immédiatement la position sur Binance.`,{parse_mode:'HTML'}).catch(()=>{});
   }
 }
-
 async function monitorTrade(symbol, tick){
   for(const trade of activeTrades.values()){
     if(trade.symbol!==symbol || trade.closed) continue;
@@ -163,6 +169,9 @@ async function monitorTrade(symbol, tick){
 function ingest(symbol,tick){
   let s=state.get(symbol); if(!s){s={candles:[],current:null,lastSignal:{},ticks:[]};state.set(symbol,s);}
   s.ticks.push(tick); if(s.ticks.length>500)s.ticks.shift();
+  // Surveille les positions ouvertes sur CHAQUE tick : TP, SL, horizon et retournement.
+  // Sans cet appel, monitorTrade existe mais n'est jamais exécuté.
+  void monitorTrade(symbol,tick).catch(err=>console.error(`❌ Trade monitor error ${symbol}:`,err.message));
   const sec=Math.floor(tick.t/1000)*1000; let c=s.current;
   if(!c||c.t!==sec){ if(c)s.candles.push(c); c={t:sec,o:tick.p,h:tick.p,l:tick.p,c:tick.p,v:tick.q}; s.current=c; if(s.candles.length>300)s.candles.shift(); } else {c.h=Math.max(c.h,tick.p);c.l=Math.min(c.l,tick.p);c.c=tick.p;c.v+=tick.q;}
   if(s.candles.length<210)return;
