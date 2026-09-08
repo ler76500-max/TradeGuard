@@ -9,6 +9,7 @@ const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const MIN_SCORE = Number(process.env.MIN_SCORE || 90);
 const COOLDOWN_MS = Number(process.env.COOLDOWN_SECONDS || 45) * 1000;
 const MAX_ALERTS_HOUR = Number(process.env.MAX_ALERTS_PER_HOUR || 20);
+let paused = false;
 
 const state = new Map();
 const recentAlerts = [];
@@ -74,6 +75,7 @@ function ingest(symbol,tick){
 async function sendSignal(symbol,s){
   const icon=s.direction==='UP'?'🟢':'🔴'; const dir=s.direction==='UP'?'HAUT':'BAS';
   const text=`${icon} <b>TRADEGUARD LIVE</b>\n\n<b>${dir} — ${symbol}</b>\n\n💰 Prix: ${s.price}\n⏱️ Horizon estimé: <b>${s.horizonSec}s</b>\n📊 Score modèle: <b>${s.score}/100</b>\n\nRSI: ${s.r.toFixed(1)}\nADX: ${s.ad.toFixed(1)}\nATR: ${s.atrPct.toFixed(2)}%\nVolume: ${s.volRatio.toFixed(2)}x\n\n🛑 Invalidation: ${s.sl.toFixed(8)}\n🎯 Objectif modèle: ${s.tp.toFixed(8)}\n\n⚠️ Signal probabiliste — pas une garantie. Paper trading recommandé.`;
+  if(paused) return;
   if(CHAT_ID) await bot.telegram.sendMessage(CHAT_ID,text,{parse_mode:'HTML'}).catch(()=>{});
 }
 function connect(){
@@ -85,8 +87,11 @@ function connect(){
 }
 bot.start(ctx=>ctx.reply('🛡️ TradeGuard Live V3 actif.\n\n/signals — état du moteur\n/pause — désactiver les alertes\n/resume — réactiver les alertes\n\nMode: analyse + paper trading.'));
 bot.command('signals',ctx=>ctx.reply(`🧠 Moteur LIVE\nScore minimum: ${MIN_SCORE}/100\nCooldown: ${COOLDOWN_MS/1000}s\nLimite: ${MAX_ALERTS_HOUR}/h\nMode: paper trading`));
-let paused=false; bot.command('pause',ctx=>{paused=true;ctx.reply('⏸️ Alertes suspendues.');}); bot.command('resume',ctx=>{paused=false;ctx.reply('▶️ Alertes réactivées.');});
-const oldSend=sendSignal; // pause gate by wrapping via function replacement isn't needed; handled below
+bot.command('test',ctx=>ctx.reply('🧪 TradeGuard OK — Telegram est bien connecté.\n\nLe moteur LIVE est actif et prêt à envoyer les alertes.'));
+bot.command('pause',ctx=>{paused=true;ctx.reply('⏸️ Alertes suspendues.');}); bot.command('resume',ctx=>{paused=false;ctx.reply('▶️ Alertes réactivées.');});
+bot.launch().then(()=>console.log('Telegram bot polling started')).catch(err=>console.error('Telegram launch error:',err.message));
 setInterval(()=>{ if(paused) recentAlerts.splice(0,recentAlerts.length); },1000);
 connect();
 console.log('TradeGuard Live V3 started');
+process.once('SIGINT',()=>bot.stop('SIGINT'));
+process.once('SIGTERM',()=>bot.stop('SIGTERM'));
