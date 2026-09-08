@@ -82,7 +82,7 @@ function connect(){
   const streams=(process.env.SYMBOLS||'').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean);
   // Binance combined trade stream. If SYMBOLS empty, fetch is avoided here for portability; default liquid majors.
   const syms=streams.length?streams:['btcusdt','ethusdt','solusdt','bnbusdt','xrpusdt','dogeusdt','adausdt','avaxusdt','linkusdt','suiusdt'];
-  const url='wss://stream.binance.com:9443/stream?streams='+syms.map(x=>x+'@trade').join('/');
+  const url='wss://data-stream.binance.vision:443/stream?streams='+syms.map(x=>x+'@trade').join('/');
   console.log('Connecting to market data:', url);
   ws=new WebSocket(url);
   ws.on('open',()=>console.log('TradeGuard LIVE connected:',syms.join(',')));
